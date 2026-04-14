@@ -1,0 +1,985 @@
+#!/usr/bin/env python3
+"""
+git-gh: GitHub workflow helper for managing PRs with local single-commit branches
+and remote patchset history.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Optional, List, Dict, Tuple
+import shlex
+
+# ANSI color codes
+RED = '\033[91m'
+GREEN = '\033[92m'
+YELLOW = '\033[93m'
+BLUE = '\033[94m'
+BOLD = '\033[1m'
+RESET = '\033[0m'
+
+# Global verbose flag
+VERBOSE = False
+
+def get_username():
+    """Get the current username from environment."""
+    return os.environ.get('USER', 'unknown')
+
+def run_cmd(cmd: str, check=True, capture_output=True, cwd=None) -> subprocess.CompletedProcess:
+    """Run a shell command and return the result."""
+    if VERBOSE:
+        print(f'{BLUE}+ {cmd}{RESET}')
+    return subprocess.run(
+        cmd,
+        shell=True,
+        check=check,
+        capture_output=capture_output,
+        text=True,
+        cwd=cwd
+    )
+
+def get_current_branch() -> str:
+    """Get the current git branch name."""
+    result = run_cmd("git rev-parse --abbrev-ref HEAD")
+    return result.stdout.strip()
+
+def get_branch_config(branch: str, key: str) -> Optional[str]:
+    """Get a git config value for a branch."""
+    result = run_cmd(f"git config branch.{branch}.{key}", check=False)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+def set_branch_config(branch: str, key: str, value: str):
+    """Set a git config value for a branch."""
+    run_cmd(f"git config branch.{branch}.{key} {shlex.quote(value)}")
+
+def get_pr_from_branch(branch: str) -> Optional[str]:
+    """Get the PR owner#number from branch config."""
+    return get_branch_config(branch, "github-pr-owner-number")
+
+def get_remote_branch_name(local_branch: str) -> str:
+    """Get the remote branch name for a local branch."""
+    stored = get_branch_config(local_branch, "github-branch")
+    if stored:
+        return stored
+    return f"dev/{get_username()}/{local_branch}"
+
+def get_merge_base(branch1: str, branch2: str) -> str:
+    """Get the merge base between two branches."""
+    result = run_cmd(f"git merge-base {branch1} {branch2}")
+    return result.stdout.strip()
+
+def get_commit_sha(ref: str) -> str:
+    """Get the SHA for a git reference."""
+    result = run_cmd(f"git rev-parse {ref}")
+    return result.stdout.strip()
+
+def get_commit_message(ref: str) -> str:
+    """Get the commit message for a reference."""
+    result = run_cmd(f"git log -1 --format=%B {ref}")
+    return result.stdout.strip()
+
+def get_commit_title(ref: str) -> str:
+    """Get the first line of commit message."""
+    result = run_cmd(f"git log -1 --format=%s {ref}")
+    return result.stdout.strip()
+
+def get_parent_branch(branch: str) -> str:
+    """Get the parent/upstream branch."""
+    merge = get_branch_config(branch, "merge")
+    remote = get_branch_config(branch, "remote")
+
+    if merge:
+        # Extract branch name from refs/heads/ format
+        if merge.startswith("refs/heads/"):
+            branch_name = merge.replace("refs/heads/", "")
+
+            # Handle local branch tracking (remote = ".")
+            if remote == ".":
+                # It's tracking a local branch
+                return branch_name
+            # Handle remote branches (e.g., origin/main)
+            elif remote and remote != ".":
+                # Return formatted as remote/branch
+                return f"{remote}/{branch_name}"
+            else:
+                # No remote specified, assume local branch
+                return branch_name
+        # Handle already formatted references
+        elif "/" in merge:
+            return merge
+        else:
+            # Plain branch name
+            return merge
+    return "origin/main"
+
+def get_pr_info(pr_number: str) -> Dict:
+    """Get PR information from GitHub."""
+    result = run_cmd(f"gh pr view {pr_number} --json number,author,headRefName,baseRefName,state,title,body,mergeable", check=False)
+    if result.returncode != 0:
+        return {}
+    return json.loads(result.stdout)
+
+def get_pr_checks(pr_number: str) -> List[Dict]:
+    """Get PR check status from GitHub."""
+    result = run_cmd(f"gh pr checks {pr_number} --json name,state,conclusion", check=False)
+    if result.returncode != 0:
+        return []
+    return json.loads(result.stdout)
+
+def fetch_remote_branch(remote_branch: str):
+    """Fetch a remote branch."""
+    run_cmd(f"git fetch origin {remote_branch}")
+
+def check_clean_worktree():
+    """Check if the worktree is clean."""
+    result = run_cmd("git status --porcelain", check=False)
+    if result.stdout.strip():
+        print(f"{RED}Error: Working tree is not clean. Commit or stash your changes.{RESET}")
+        sys.exit(1)
+
+def cmd_new_branch(args):
+    """Create a new branch based on parent."""
+    parent = args.parent
+    if args.child:
+        parent = get_current_branch()
+    elif not parent:
+        parent = "origin/main"
+
+    # Create the branch
+    run_cmd(f"git checkout -b {args.branch_name} -t {parent}")
+    print(f"Created branch '{args.branch_name}' tracking '{parent}'")
+
+def cmd_checkout(args):
+    """Checkout a PR into a local branch."""
+    pr_info = get_pr_info(args.pr_number)
+    if not pr_info:
+        print(f"{RED}Error: PR #{args.pr_number} not found{RESET}")
+        sys.exit(1)
+
+    remote_branch = pr_info['headRefName']
+    author = pr_info['author']['login']
+    base_ref = pr_info['baseRefName']
+
+    # Determine local branch name
+    if args.name:
+        local_branch = args.name
+    elif author == get_username():
+        # Strip dev/username/ prefix
+        local_branch = remote_branch.split('/')[-1]
+    else:
+        local_branch = f"{author}_{remote_branch.split('/')[-1]}"
+
+    # Handle --replace flag
+    if args.replace:
+        current = get_current_branch()
+        if current == "main":
+            print(f"{RED}Error: Cannot replace 'main' branch{RESET}")
+            sys.exit(1)
+        local_branch = current
+
+    # Fetch the remote branch
+    print(f"Fetching {remote_branch}...")
+    fetch_remote_branch(remote_branch)
+
+    # Find merge base
+    merge_base = get_merge_base(f"origin/{remote_branch}", f"origin/{base_ref}")
+
+    # Create temporary branch to get the squashed diff
+    temp_branch = f"temp_{local_branch}_{os.getpid()}"
+
+    if not args.replace:
+        # Create new branch from base
+        run_cmd(f"git checkout -b {local_branch} {merge_base}")
+    else:
+        # Reset current branch to merge base
+        run_cmd(f"git reset --hard {merge_base}")
+
+    # Apply the squashed diff
+    result = run_cmd(f"git diff {merge_base}..origin/{remote_branch}", capture_output=True)
+    if result.stdout:
+        # Apply the diff
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as f:
+            f.write(result.stdout)
+            patch_file = f.name
+
+        run_cmd(f"git apply {patch_file}")
+        os.unlink(patch_file)
+
+        # Get the PR info for commit message
+        title = pr_info['title']
+        body = pr_info.get('body', '')
+        commit_msg = f"{title}\n\n{body}" if body else title
+
+        # Commit the changes
+        run_cmd("git add -A")
+        run_cmd(f"git commit -m {shlex.quote(commit_msg)}")
+
+    # Store PR metadata
+    owner_repo = run_cmd("gh repo view --json owner,name").stdout.strip()
+    owner_repo_data = json.loads(owner_repo)
+    pr_owner_number = f"{owner_repo_data['owner']['login']}#{owner_repo_data['name']}#{args.pr_number}"
+
+    set_branch_config(local_branch, "github-pr-owner-number", pr_owner_number)
+    set_branch_config(local_branch, "github-branch", remote_branch)
+    set_branch_config(local_branch, "github-last-upload-sha", get_commit_sha("HEAD"))
+
+    print(f"Checked out PR #{args.pr_number} into branch '{local_branch}'")
+
+def cmd_patch(args):
+    """Cherry-pick PR changes into current branch."""
+    current = get_current_branch()
+    pr_info = get_pr_info(args.pr_number)
+    if not pr_info:
+        print(f"{RED}Error: PR #{args.pr_number} not found{RESET}")
+        sys.exit(1)
+
+    # Check if branch is "virgin" (matches upstream)
+    parent = get_parent_branch(current)
+    if run_cmd(f"git diff {parent}..HEAD", check=False).stdout:
+        existing_pr = get_pr_from_branch(current)
+        if existing_pr:
+            print(f"{RED}Error: Current branch already has PR #{existing_pr}{RESET}")
+            sys.exit(1)
+
+    remote_branch = pr_info['headRefName']
+    base_ref = pr_info['baseRefName']
+
+    # Fetch the remote branch
+    print(f"Fetching {remote_branch}...")
+    fetch_remote_branch(remote_branch)
+
+    # Find merge base and apply diff
+    merge_base = get_merge_base(f"origin/{remote_branch}", f"origin/{base_ref}")
+    result = run_cmd(f"git diff {merge_base}..origin/{remote_branch}", capture_output=True)
+
+    if result.stdout:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as f:
+            f.write(result.stdout)
+            patch_file = f.name
+
+        run_cmd(f"git apply {patch_file}")
+        os.unlink(patch_file)
+
+        # Commit with PR info
+        title = pr_info['title']
+        body = pr_info.get('body', '')
+        commit_msg = f"{title}\n\n{body}" if body else title
+
+        run_cmd("git add -A")
+        run_cmd(f"git commit -m {shlex.quote(commit_msg)}")
+
+        # Store PR metadata
+        owner_repo = run_cmd("gh repo view --json owner,name").stdout.strip()
+        owner_repo_data = json.loads(owner_repo)
+        pr_owner_number = f"{owner_repo_data['owner']['login']}#{owner_repo_data['name']}#{args.pr_number}"
+
+        set_branch_config(current, "github-pr-owner-number", pr_owner_number)
+        set_branch_config(current, "github-branch", remote_branch)
+        set_branch_config(current, "github-last-upload-sha", get_commit_sha("HEAD"))
+
+        print(f"Patched PR #{args.pr_number} into current branch")
+
+def get_stack_tree(branch: str) -> str:
+    """Generate a stack tree for PR description."""
+    # Build the stack hierarchy
+    stack = []
+    current_branch = branch
+
+    # Walk up to find all parents
+    parents = []
+    parent = get_parent_branch(current_branch)
+    temp_branch = current_branch
+    while parent and parent != "origin/main":
+        parents.append(parent)
+        temp_branch = parent
+        parent = get_parent_branch(temp_branch)
+    parents.reverse()
+
+    # Walk down to find all children
+    children = []
+    result = run_cmd("git for-each-ref --format='%(refname:short)' refs/heads/", capture_output=True)
+    all_branches = result.stdout.strip().split('\n')
+
+    def find_children(parent_branch):
+        found = []
+        for b in all_branches:
+            if get_parent_branch(b) == parent_branch:
+                found.append(b)
+        return found
+
+    # Build the tree structure
+    tree_lines = ["\n```"]
+    tree_lines.append("Stack:")
+
+    # Add parents
+    for i, p in enumerate(parents):
+        pr_num = get_pr_from_branch(p)
+        indent = "  " * i
+        if pr_num:
+            _, _, num = pr_num.split('#')
+            tree_lines.append(f"{indent}├─ #{num} ({p})")
+        else:
+            tree_lines.append(f"{indent}├─ {p}")
+
+    # Add current branch
+    indent = "  " * len(parents)
+    tree_lines.append(f"{indent}├─ **[This PR] ({branch})**")
+
+    # Add children recursively
+    def add_children(parent, depth):
+        children = find_children(parent)
+        for child in children:
+            if child != branch:
+                pr_num = get_pr_from_branch(child)
+                indent = "  " * depth
+                if pr_num:
+                    _, _, num = pr_num.split('#')
+                    tree_lines.append(f"{indent}├─ #{num} ({child})")
+                else:
+                    tree_lines.append(f"{indent}├─ {child}")
+                add_children(child, depth + 1)
+
+    add_children(branch, len(parents) + 1)
+    tree_lines.append("```")
+
+    return "\n".join(tree_lines)
+
+def cmd_upload(args):
+    """Upload changes to GitHub, creating patchsets."""
+    current = get_current_branch()
+    check_clean_worktree()
+
+    # Get branch metadata
+    pr_owner_number = get_pr_from_branch(current)
+    remote_branch = get_remote_branch_name(current)
+    parent = get_parent_branch(current)
+
+    # Check if parent branch needs to be uploaded first (for stacked branches)
+    if parent != "origin/main" and not parent.startswith("origin/"):
+        # Parent is a local branch, check if it's up to date
+        parent_last_upload = get_branch_config(parent, "github-last-upload-sha")
+        parent_head = get_commit_sha(parent)
+
+        if parent_last_upload != parent_head:
+            print(f"{RED}Error: Parent branch '{parent}' has uncommitted changes.{RESET}")
+            print(f"Please upload the parent branch first with: git-gh upload")
+            print(f"(while on branch '{parent}')")
+            sys.exit(1)
+
+    # Get local commit info
+    local_sha = get_commit_sha("HEAD")
+    local_tree = run_cmd(f"git rev-parse HEAD^{{tree}}").stdout.strip()
+    commit_msg = get_commit_message("HEAD")
+    title = commit_msg.split('\n')[0]
+    body = '\n'.join(commit_msg.split('\n')[1:]).strip()
+
+    if pr_owner_number:
+        # PR exists, fetch remote state
+        print(f"Fetching remote branch {remote_branch}...")
+        fetch_remote_branch(remote_branch)
+
+        # Check if merge bases with origin/main have changed
+        # This catches the case where origin/main has moved forward
+        remote_head = f"origin/{remote_branch}"
+
+        # Check if remote exists
+        remote_exists = run_cmd(f"git rev-parse {remote_head}", check=False).returncode == 0
+        if remote_exists:
+            # Compare merge bases with origin/main, not with immediate parent
+            # For stacked branches, the merge base with parent will naturally differ
+            local_merge_base_main = get_merge_base("HEAD", "origin/main")
+            remote_merge_base_main = get_merge_base(remote_head, "origin/main")
+
+            if local_merge_base_main != remote_merge_base_main:
+                print(f"{RED}Error: Base has diverged from origin/main!{RESET}")
+                print(f"Local merge base with origin/main: {local_merge_base_main}")
+                print(f"Remote merge base with origin/main: {remote_merge_base_main}")
+                print(f"Please run 'git-gh rebase' first")
+                sys.exit(1)
+
+            # Get patchset title
+            if args.title:
+                patchset_title = args.title
+            else:
+                patchset_title = input(f"Enter patchset title: ").strip()
+
+            # Create patchset commit
+            commit_message = f"PS: {patchset_title}"
+
+            # Create the commit object with our tree and remote parent
+            remote_sha = get_commit_sha(remote_head)
+            new_commit = run_cmd(
+                f"git commit-tree {local_tree} -p {remote_sha} -m {shlex.quote(commit_message)}"
+            ).stdout.strip()
+
+            # Push the new commit
+            print(f"Pushing patchset")
+            run_cmd(f"git push origin {new_commit}:refs/heads/{remote_branch}")
+
+        else:
+            # Remote doesn't exist yet but PR config exists, push initial
+            print(f"Pushing initial commit to {remote_branch}...")
+            run_cmd(f"git push origin HEAD:refs/heads/{remote_branch}")
+    else:
+        # Create new PR
+        print(f"Creating new PR for branch {current}...")
+
+        # Handle stacked branches differently
+        if parent != "origin/main" and not parent.startswith("origin/"):
+            # This is a stacked branch based on another local branch
+            parent_remote = get_remote_branch_name(parent)
+
+            # Fetch the parent's remote branch
+            print(f"Fetching parent's remote branch {parent_remote}...")
+            fetch_remote_branch(parent_remote)
+
+            # Create a new commit on top of parent's remote history
+            parent_remote_head = f"origin/{parent_remote}"
+
+            # Check if parent remote exists
+            if run_cmd(f"git rev-parse {parent_remote_head}", check=False).returncode != 0:
+                print(f"{RED}Error: Parent branch '{parent}' has no remote branch yet.{RESET}")
+                print(f"Please upload the parent branch first.")
+                sys.exit(1)
+
+            # Create a commit with our tree on top of parent's remote HEAD
+            print(f"Creating commit on top of parent's remote history...")
+            new_commit = run_cmd(
+                f"git commit-tree {local_tree} -p {parent_remote_head} -m {shlex.quote(commit_msg)}"
+            ).stdout.strip()
+
+            # Push this commit as the initial state of our remote branch
+            run_cmd(f"git push origin {new_commit}:refs/heads/{remote_branch}")
+
+            # Set the base for PR creation
+            base = parent_remote
+        else:
+            # Normal branch based on origin/main or another remote
+            # Just push HEAD as-is
+            run_cmd(f"git push origin HEAD:refs/heads/{remote_branch}")
+
+            # Determine base branch for PR
+            if parent.startswith("origin/"):
+                # Remote branch, strip the origin/ prefix
+                base = parent.replace("origin/", "")
+            else:
+                # Should not happen given our check above, but handle it anyway
+                base = get_remote_branch_name(parent)
+
+        # Create PR description
+        pr_body = body
+
+        # Add stack tree if this is part of a stack
+        if parent != "origin/main":
+            pr_body = pr_body + "\n\n" + get_stack_tree(current)
+
+        # Create the PR
+        cmd = f"gh pr create --title {shlex.quote(title)} --body {shlex.quote(pr_body)} --base {base} --head {remote_branch}"
+        result = run_cmd(cmd)
+
+        # Extract PR number from output
+        pr_url = result.stdout.strip()
+        pr_number = pr_url.split('/')[-1]
+
+        # Store PR metadata
+        owner_repo = run_cmd("gh repo view --json owner,name").stdout.strip()
+        owner_repo_data = json.loads(owner_repo)
+        pr_owner_number = f"{owner_repo_data['owner']['login']}#{owner_repo_data['name']}#{pr_number}"
+
+        set_branch_config(current, "github-pr-owner-number", pr_owner_number)
+        set_branch_config(current, "github-branch", remote_branch)
+
+        print(f"Created PR #{pr_number}")
+
+    # Update last upload SHA
+    set_branch_config(current, "github-last-upload-sha", local_sha)
+
+    # Update PR description for stacked PRs
+    if parent != "origin/main" and pr_owner_number:
+        _, _, pr_num = pr_owner_number.split('#')
+        pr_info = get_pr_info(pr_num)
+        if pr_info:
+            # Get current body and update stack tree
+            current_body = pr_info.get('body', '')
+
+            # Remove old stack tree if present
+            if "```\nStack:" in current_body:
+                parts = current_body.split("```\nStack:")
+                if len(parts) > 1 and "```" in parts[1]:
+                    end_idx = parts[1].index("```") + 3
+                    current_body = parts[0] + parts[1][end_idx:]
+
+            # Add new stack tree
+            new_body = current_body.rstrip() + "\n\n" + get_stack_tree(current)
+
+            # Update PR description
+            run_cmd(f"gh pr edit {pr_num} --body {shlex.quote(new_body)}")
+
+def cmd_rebase(args):
+    """Rebase a branch, creating merge commits remotely."""
+    # If branch is specified, checkout that branch first
+    if hasattr(args, 'branch') and args.branch:
+        target_branch = args.branch
+        print(f"Switching to branch {target_branch}...")
+        result = run_cmd(f"git checkout {target_branch}", check=False)
+        if result.returncode != 0:
+            print(f"{RED}Error: Failed to checkout branch '{target_branch}'{RESET}")
+            sys.exit(1)
+
+    current = get_current_branch()
+    check_clean_worktree()
+
+    # Get PR and branch info
+    pr_owner_number = get_pr_from_branch(current)
+    if not pr_owner_number:
+        print(f"{RED}Error: Current branch has no associated PR{RESET}")
+        sys.exit(1)
+
+    remote_branch = get_remote_branch_name(current)
+    parent = get_parent_branch(current)
+
+    # Save the original commit message before starting rebase
+    original_commit_msg = get_commit_message("HEAD")
+
+    # Fetch remote
+    print(f"Fetching remote branch {remote_branch}...")
+    fetch_remote_branch(remote_branch)
+
+    # Check if origin/main has moved (not comparing with immediate parent for stacked branches)
+    remote_head = f"origin/{remote_branch}"
+    local_merge_base_main = get_merge_base("HEAD", "origin/main")
+    remote_merge_base_main = get_merge_base(remote_head, "origin/main")
+
+    if local_merge_base_main != remote_merge_base_main:
+        print(f"{YELLOW}Warning: Base has diverged from origin/main, but continuing...{RESET}")
+
+    # Create diff between local and remote
+    print("Creating diff of local changes...")
+    patch_file = f"/tmp/git-gh-rebase-{current}.patch"
+    # Use format-patch instead of diff since we'll apply with 'git am'
+    diff_result = run_cmd(f"git format-patch {remote_head}..HEAD --stdout", capture_output=True)
+
+    has_diff = bool(diff_result.stdout.strip())
+    if has_diff:
+        with open(patch_file, 'w') as f:
+            f.write(diff_result.stdout)
+
+    # Create temp rebase branch
+    rebase_branch = f"{current}_rebase"
+    print(f"Creating temporary branch {rebase_branch}...")
+    run_cmd(f"git checkout -B {rebase_branch} {remote_head}")
+
+    # Merge upstream - use remote version of parent if it's a local branch
+    if parent.startswith("origin/"):
+        # Parent is already a remote branch, use as-is
+        merge_target = parent
+        print(f"First we are going to merge {merge_target} into the latest uploaded patchset")
+    else:
+        # Parent is a local branch, need to merge its remote version
+        parent_remote_branch = get_remote_branch_name(parent)
+        merge_target = f"origin/{parent_remote_branch}"
+        print(f"First we are going to merge {merge_target} (remote of {parent}) into the latest uploaded patchset")
+        # Fetch the parent's remote branch to ensure we have latest
+        fetch_remote_branch(parent_remote_branch)
+
+    merge_result = run_cmd(f"git merge {merge_target}", check=False)
+
+    if merge_result.returncode != 0:
+        print(f"\n{YELLOW}═══════════════════════════════════════════════════════════════{RESET}")
+        print(f"{YELLOW}MERGE CONFLICT DETECTED!{RESET}")
+        print(f"{YELLOW}═══════════════════════════════════════════════════════════════{RESET}")
+        print(f"\nPlease follow these steps:")
+        print(f"1. Open another terminal")
+        print(f"2. Resolve the conflicts")
+        print(f"3. Run: {BOLD}git add <resolved files>{RESET}")
+        print(f"4. Run: {BOLD}git merge --continue{RESET}")
+        print(f"5. Return here and press ENTER to continue")
+        print(f"{YELLOW}═══════════════════════════════════════════════════════════════{RESET}")
+        input("\nPress ENTER after completing the merge in another terminal...")
+
+        # Verify merge was completed
+        if run_cmd("git status --porcelain", check=False).stdout.strip():
+            print(f"{RED}Error: Merge not completed or working tree not clean{RESET}")
+            sys.exit(1)
+
+    # Apply diff if exists
+    if has_diff:
+        print("Finally we are going to apply the diff from the local branch to the last upload")
+        patch_result = run_cmd(f"git am -3 {patch_file}", check=False)
+
+        if patch_result.returncode != 0:
+            print(f"\n{YELLOW}═══════════════════════════════════════════════════════════════{RESET}")
+            print(f"{YELLOW}PATCH CONFLICT DETECTED!{RESET}")
+            print(f"{YELLOW}═══════════════════════════════════════════════════════════════{RESET}")
+            print(f"\nPlease follow these steps:")
+            print(f"1. Open another terminal")
+            print(f"2. Resolve the conflicts")
+            print(f"3. Run: {BOLD}git add <resolved files>{RESET}")
+            print(f"4. Run: {BOLD}git am --continue{RESET}")
+            print(f"5. Return here and press ENTER to continue")
+            print(f"{YELLOW}═══════════════════════════════════════════════════════════════{RESET}")
+            input("\nPress ENTER after completing the patch application in another terminal...")
+
+            # Verify patch was applied
+            if run_cmd("git status --porcelain", check=False).stdout.strip():
+                print(f"{RED}Error: Patch not applied or working tree not clean{RESET}")
+                sys.exit(1)
+
+    # Push the rebased branch
+    print(f"Pushing rebased branch...")
+    run_cmd(f"git push --no-verify origin HEAD:refs/heads/{remote_branch}")
+
+    # Squash back to original branch
+    print("Squashing back to original branch...")
+    temp_tree = run_cmd("git rev-parse HEAD^{tree}").stdout.strip()
+    parent_sha = get_commit_sha(parent)
+
+    run_cmd(f"git checkout {current}")
+    run_cmd(f"git reset --hard {parent_sha}")
+
+    # Use the saved original commit message instead of the merge commit message
+    new_commit = run_cmd(
+        f"git commit-tree {temp_tree} -p {parent_sha} -m {shlex.quote(original_commit_msg)}"
+    ).stdout.strip()
+    run_cmd(f"git reset --hard {new_commit}")
+
+    # Clean up
+    run_cmd(f"git branch -D {rebase_branch}")
+    if has_diff and os.path.exists(patch_file):
+        os.unlink(patch_file)
+
+    print(f"Rebase complete!")
+
+def format_branch_status(branch: str, is_current: bool = False) -> str:
+    """Format a branch with its PR status."""
+    pr_owner_number = get_pr_from_branch(branch)
+
+    # Build status prefix [--]
+    status_marks = ["─", "─"]
+
+    if pr_owner_number:
+        _, _, pr_num = pr_owner_number.split('#')
+
+        # Get PR checks
+        checks = get_pr_checks(pr_num)
+        if checks:
+            all_pass = all(c.get('conclusion') == 'success' for c in checks)
+            status_marks[0] = f"{GREEN}✓{RESET}" if all_pass else f"{RED}✗{RESET}"
+
+        # Get PR info for approval status
+        pr_info = get_pr_info(pr_num)
+        if pr_info:
+            # Simple heuristic: check if PR is approved (would need more API calls for full info)
+            if pr_info.get('state') == 'MERGED':
+                status_marks[1] = f"{GREEN}✓{RESET}"
+
+    status = f"[{status_marks[0]}{status_marks[1]}]"
+
+    # Format branch name
+    if is_current:
+        branch_display = f"{BOLD}{BLUE}{branch}{RESET}"
+    else:
+        branch_display = branch
+
+    # Get commit title
+    try:
+        title = get_commit_title(branch)
+    except:
+        title = ""
+
+    # Add PR info
+    pr_str = ""
+    state_str = ""
+    if pr_owner_number:
+        _, _, pr_num = pr_owner_number.split('#')
+        pr_str = f" #{pr_num}"
+
+        pr_info = get_pr_info(pr_num)
+        if pr_info:
+            state = pr_info.get('state', '').upper()
+            if state == 'CLOSED':
+                state_str = f" {YELLOW}[CLOSED]{RESET}"
+            elif state == 'MERGED':
+                state_str = f" {GREEN}[MERGED]{RESET}"
+
+    return f"{status} {branch_display} - {title}{pr_str}{state_str}"
+
+def cmd_branches(args):
+    """List all branches with PR status."""
+    print("Updating remote...")
+    run_cmd("git fetch origin")
+
+    # Print header
+    print("\n┌─┬─┐")
+    print("│C│A│ C=CI Status, A=Approval Status")
+    print("└─┴─┘")
+    print()
+
+    # Get all branches
+    result = run_cmd("git for-each-ref --format='%(refname:short)' refs/heads/")
+    branches = result.stdout.strip().split('\n')
+    current = get_current_branch()
+
+    # Build branch hierarchy
+    branch_tree = {}
+    for branch in branches:
+        if branch.startswith("ARCHIVED."):
+            continue
+        parent = get_parent_branch(branch)
+        if parent not in branch_tree:
+            branch_tree[parent] = []
+        branch_tree[parent].append(branch)
+
+    # Print branches recursively
+    def print_tree(parent, indent=""):
+        if parent in branch_tree:
+            children = branch_tree[parent]
+            for i, child in enumerate(children):
+                is_last = i == len(children) - 1
+                connector = "└─" if is_last else "├─"
+
+                line = format_branch_status(child, child == current)
+                print(f"{indent}{connector} {line}")
+
+                next_indent = indent + ("   " if is_last else "│  ")
+                print_tree(child, next_indent)
+
+    # Start from origin/main
+    print_tree("origin/main")
+
+def cmd_status(args):
+    """Show status of current stack."""
+    current = get_current_branch()
+
+    # Show stack tree (similar to branches but limited to current stack)
+    print("\n┌─┬─┐")
+    print("│C│A│ C=CI Status, A=Approval Status")
+    print("└─┴─┘")
+    print()
+
+    # Build the stack
+    stack = []
+    branch = current
+    while branch and branch != "origin/main":
+        stack.append(branch)
+        parent = get_parent_branch(branch)
+        if parent and not parent.startswith("origin/"):
+            branch = parent
+        else:
+            break
+    stack.reverse()
+
+    # Print the stack
+    for i, branch in enumerate(stack):
+        indent = "  " * i
+        is_current = branch == current
+        line = format_branch_status(branch, is_current)
+        print(f"{indent}{line}")
+
+    # Show diff status for current branch
+    pr_owner_number = get_pr_from_branch(current)
+    if pr_owner_number:
+        remote_branch = get_remote_branch_name(current)
+        fetch_remote_branch(remote_branch)
+
+        remote_head = f"origin/{remote_branch}"
+        if run_cmd(f"git rev-parse {remote_head}", check=False).returncode == 0:
+            # Compare local and remote
+            local_tree = run_cmd("git rev-parse HEAD^{tree}").stdout.strip()
+            remote_tree = run_cmd(f"git rev-parse {remote_head}^{{tree}}").stdout.strip()
+
+            if local_tree == remote_tree:
+                print(f"\n{GREEN}✓ Local matches last upload{RESET}")
+            else:
+                print(f"\n{YELLOW}Changes since last upload:{RESET}")
+
+                # Show summary
+                stats = run_cmd(f"git diff --stat {remote_head}..HEAD").stdout
+                if stats:
+                    for line in stats.split('\n')[:5]:  # Limit output
+                        print(f"  {line}")
+                    print(f"\n  Use --stat or -p for more details")
+
+                # Handle --stat and -p flags
+                if args.stat:
+                    print("\nDetailed stats:")
+                    result = run_cmd(f"git diff --stat {remote_head}..HEAD")
+                    print(result.stdout)
+                elif args.p:
+                    print("\nFull diff:")
+                    result = run_cmd(f"git diff {remote_head}..HEAD")
+                    print(result.stdout)
+
+        # Run gh pr checks
+        _, _, pr_num = pr_owner_number.split('#')
+        print(f"\nPR #{pr_num} checks:")
+        os.environ['GH_PAGER'] = ''
+        run_cmd(f"gh pr checks {pr_num}", check=False, capture_output=False)
+
+def cmd_web(args):
+    """Open the GitHub PR page."""
+    current = get_current_branch()
+    pr_owner_number = get_pr_from_branch(current)
+
+    if not pr_owner_number:
+        print(f"{RED}Error: No PR associated with current branch{RESET}")
+        sys.exit(1)
+
+    _, _, pr_num = pr_owner_number.split('#')
+    run_cmd(f"gh pr view {pr_num} --web", capture_output=False)
+
+def cmd_archive(args):
+    """Archive closed PR branches."""
+    # Get all branches with PRs
+    result = run_cmd("git for-each-ref --format='%(refname:short)' refs/heads/")
+    branches = result.stdout.strip().split('\n')
+
+    to_archive = []
+    for branch in branches:
+        if branch.startswith("ARCHIVED."):
+            continue
+
+        pr_owner_number = get_pr_from_branch(branch)
+        if pr_owner_number:
+            _, _, pr_num = pr_owner_number.split('#')
+            pr_info = get_pr_info(pr_num)
+
+            if pr_info and pr_info.get('state') in ['CLOSED', 'MERGED']:
+                to_archive.append((branch, pr_num, pr_info.get('state')))
+
+    if not to_archive:
+        print("No closed PRs to archive")
+        return
+
+    # Show branches to archive
+    print("Branches to archive:")
+    for branch, pr_num, state in to_archive:
+        print(f"  {branch} (PR #{pr_num} - {state})")
+
+    # Confirm
+    response = input("\nProceed with archiving? [y/N]: ").strip().lower()
+    if response != 'y':
+        print("Aborted")
+        return
+
+    # Archive branches
+    for branch, pr_num, state in to_archive:
+        new_name = f"ARCHIVED.{branch}"
+        run_cmd(f"git branch -m {branch} {new_name}")
+        print(f"Archived {branch} -> {new_name}")
+
+    # Ask about deletion
+    response = input("\nDelete archived branches? [y/N]: ").strip().lower()
+    if response == 'y':
+        for branch, _, _ in to_archive:
+            new_name = f"ARCHIVED.{branch}"
+            run_cmd(f"git branch -D {new_name}")
+            print(f"Deleted {new_name}")
+
+def cmd_presubmit(args):
+    """Run presubmit checks."""
+    current = get_current_branch()
+    parent = get_parent_branch(current)
+
+    # Convert parent to local branch name if it's a remote
+    if parent.startswith("origin/"):
+        merge_base = parent
+    else:
+        merge_base = parent
+
+    cmd = f"tools/run_presubmit --merge-base {merge_base}"
+    print(f"Running: {cmd}")
+    run_cmd(cmd, capture_output=False)
+
+def main():
+    parser = argparse.ArgumentParser(description='GitHub workflow helper')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Show all commands being executed')
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # new-branch / nb
+    nb_parser = subparsers.add_parser('new-branch', aliases=['nb'], help='Create a new branch')
+    nb_parser.add_argument('branch_name', help='Name of the new branch')
+    nb_parser.add_argument('--parent', help='Parent branch (default: origin/main)')
+    nb_parser.add_argument('--child', action='store_true', help='Create as child of current branch')
+
+    # checkout
+    co_parser = subparsers.add_parser('checkout', help='Checkout a PR')
+    co_parser.add_argument('pr_number', help='PR number')
+    co_parser.add_argument('name', nargs='?', help='Optional branch name')
+    co_parser.add_argument('--replace', action='store_true', help='Replace current branch')
+
+    # patch
+    patch_parser = subparsers.add_parser('patch', help='Cherry-pick PR changes')
+    patch_parser.add_argument('pr_number', help='PR number')
+
+    # upload / upl
+    upload_parser = subparsers.add_parser('upload', aliases=['upl'], help='Upload changes')
+    upload_parser.add_argument('-t', '--title', help='Patchset title')
+
+    # rebase
+    rebase_parser = subparsers.add_parser('rebase', help='Rebase current or specified branch')
+    rebase_parser.add_argument('branch', nargs='?', help='Optional branch to rebase (will checkout first)')
+
+    # branches
+    branches_parser = subparsers.add_parser('branches', help='List branches with PR status')
+
+    # status
+    status_parser = subparsers.add_parser('status', help='Show current stack status')
+    status_parser.add_argument('--stat', action='store_true', help='Show diff stats')
+    status_parser.add_argument('-p', action='store_true', help='Show full diff')
+    status_parser.add_argument('--all', action='store_true', help='Show for all branches in stack')
+
+    # web
+    web_parser = subparsers.add_parser('web', help='Open PR in browser')
+
+    # archive
+    archive_parser = subparsers.add_parser('archive', help='Archive closed PRs')
+
+    # presubmit
+    presubmit_parser = subparsers.add_parser('presubmit', help='Run presubmit checks')
+
+    args = parser.parse_args()
+
+    # Set global verbose flag
+    global VERBOSE
+    VERBOSE = args.verbose
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    # Map commands to functions
+    commands = {
+        'new-branch': cmd_new_branch,
+        'nb': cmd_new_branch,
+        'checkout': cmd_checkout,
+        'patch': cmd_patch,
+        'upload': cmd_upload,
+        'upl': cmd_upload,
+        'rebase': cmd_rebase,
+        'branches': cmd_branches,
+        'status': cmd_status,
+        'web': cmd_web,
+        'archive': cmd_archive,
+        'presubmit': cmd_presubmit,
+    }
+
+    try:
+        commands[args.command](args)
+    except subprocess.CalledProcessError as e:
+        print(f"{RED}Command failed: {e.cmd}{RESET}")
+        if e.stderr:
+            print(e.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{YELLOW}Interrupted{RESET}")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

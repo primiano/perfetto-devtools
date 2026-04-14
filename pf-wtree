@@ -1,0 +1,192 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Preserve the original stdout on fd 3, then redirect stdout to stderr.
+# All progress output goes to stderr; only machine-readable results (currently
+# just the destination path from `new`) are written to fd 3 so a shell wrapper
+# can capture them with $(...) to cd into the new worktree.
+exec 3>&1 >&2
+
+MAIN=/s/perfetto
+PREFIX=/s/pf-
+FOLDERS_JSON="$HOME/.claudeck/config/folders.json"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+usage() {
+  cat >&2 <<EOF
+Usage: pf-wtree <command> [args]
+
+Commands:
+  new <branch>       Reflink-copy $MAIN to ${PREFIX}<branch>, register it as a
+                     git worktree for a new branch, add a claudeck folders.json
+                     entry, and open a tmux session.
+  rm  <branch>       Remove worktree ${PREFIX}<branch>, its admin dir, the
+                     folders.json entry, and the tmux session. (Does NOT
+                     delete the branch.)
+  ls                 List worktrees.
+EOF
+  exit 1
+}
+
+# --- folders.json helpers (python3, atomic writes) --------------------------
+
+folders_add() {
+  local name="$1" path="$2"
+  [[ -f "$FOLDERS_JSON" ]] || { echo "[]" > "$FOLDERS_JSON"; }
+  python3 - "$FOLDERS_JSON" "$name" "$path" <<'PY'
+import json, os, sys, tempfile
+fp, name, path = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(fp) as f:
+    data = json.load(f)
+if not isinstance(data, list):
+    sys.exit(f"folders.json is not a JSON array: {fp}")
+for entry in data:
+    if entry.get("name") == name:
+        entry["path"] = path  # idempotent: refresh path
+        break
+else:
+    data.append({"name": name, "path": path})
+d = os.path.dirname(fp) or "."
+with tempfile.NamedTemporaryFile("w", dir=d, delete=False) as tmp:
+    json.dump(data, tmp, indent=2)
+    tmp.write("\n")
+    tmpname = tmp.name
+os.replace(tmpname, fp)
+PY
+}
+
+folders_remove() {
+  local name="$1"
+  [[ -f "$FOLDERS_JSON" ]] || return 0
+  python3 - "$FOLDERS_JSON" "$name" <<'PY'
+import json, os, sys, tempfile
+fp, name = sys.argv[1], sys.argv[2]
+with open(fp) as f:
+    data = json.load(f)
+if not isinstance(data, list):
+    sys.exit(f"folders.json is not a JSON array: {fp}")
+new = [e for e in data if e.get("name") != name]
+if new == data:
+    sys.exit(0)  # nothing to do
+d = os.path.dirname(fp) or "."
+with tempfile.NamedTemporaryFile("w", dir=d, delete=False) as tmp:
+    json.dump(new, tmp, indent=2)
+    tmp.write("\n")
+    tmpname = tmp.name
+os.replace(tmpname, fp)
+PY
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_new() {
+  local branch="${1:-}"
+  [[ -n "$branch" ]] || usage
+  local dest="${PREFIX}${branch}"
+  local wt_admin="$MAIN/.git/worktrees/$branch"
+  local folder_name="pf-${branch}"
+  local session="pf-${branch}"
+
+  [[ -d "$MAIN/.git" ]]  || die "no git repo at $MAIN"
+  [[ ! -e "$dest" ]]     || die "$dest already exists"
+  [[ ! -e "$wt_admin" ]] || die "worktree admin dir already exists: $wt_admin"
+
+  if git -C "$MAIN" worktree list --porcelain | grep -q "^branch refs/heads/$branch$"; then
+    die "branch '$branch' is already checked out in another worktree"
+  fi
+
+  if ! git -C "$MAIN" show-ref --verify --quiet "refs/heads/$branch"; then
+    echo ">> creating branch $branch at $(git -C "$MAIN" rev-parse --short HEAD)"
+    git -C "$MAIN" branch "$branch"
+  else
+    echo ">> branch $branch already exists, reusing"
+  fi
+
+  echo ">> cp -a --reflink=auto $MAIN -> $dest"
+  cp -a --reflink=auto "$MAIN" "$dest"
+
+  # The copy brought along a full .git dir. Drop it — this tree will be a
+  # linked worktree of the main repo instead.
+  rm -rf "$dest/.git"
+
+  echo ">> registering worktree admin at $wt_admin"
+  mkdir -p "$wt_admin"
+  echo "ref: refs/heads/$branch" > "$wt_admin/HEAD"
+  echo "../.."                  > "$wt_admin/commondir"
+  echo "$dest/.git"             > "$wt_admin/gitdir"
+  cp "$MAIN/.git/index" "$wt_admin/index"
+
+  echo "gitdir: $wt_admin" > "$dest/.git"
+
+  git -C "$dest" rev-parse --show-toplevel >/dev/null \
+    || die "worktree registration failed"
+  echo ">> git status in $dest:"
+  git -C "$dest" status -sb | head -n 20 || true
+
+  echo ">> adding $folder_name -> $dest to $FOLDERS_JSON"
+  folders_add "$folder_name" "$dest"
+
+  if tmux has-session -t "$session" 2>/dev/null; then
+    echo ">> tmux session '$session' already exists"
+  else
+    echo ">> creating tmux session '$session' at $dest"
+    tmux new-session -d -s "$session" -c "$dest"
+  fi
+
+  echo
+  echo "done."
+  echo "  worktree: $dest"
+  echo "  branch:   $branch"
+  echo "  tmux:     tmux attach -t $session"
+
+  # Machine-readable: emit the destination path on the original stdout so a
+  # shell wrapper can `cd "$(pf-wtree new ...)"`.
+  echo "$dest" >&3
+}
+
+cmd_rm() {
+  local branch="${1:-}"
+  [[ -n "$branch" ]] || usage
+  local dest="${PREFIX}${branch}"
+  local wt_admin="$MAIN/.git/worktrees/$branch"
+  local folder_name="pf-${branch}"
+  local session="pf-${branch}"
+  local force="${2:-}"
+
+  [[ -e "$dest" || -e "$wt_admin" ]] || die "nothing to remove for '$branch'"
+
+  if [[ -d "$dest" && "$force" != "--force" ]]; then
+    if ! git -C "$dest" diff --quiet || ! git -C "$dest" diff --cached --quiet; then
+      die "worktree $dest has uncommitted changes (use: pf-wtree rm $branch --force)"
+    fi
+  fi
+
+  if tmux has-session -t "$session" 2>/dev/null; then
+    echo ">> killing tmux session $session"
+    tmux kill-session -t "$session"
+  fi
+
+  echo ">> rm -rf $dest"
+  rm -rf "$dest"
+  echo ">> rm -rf $wt_admin"
+  rm -rf "$wt_admin"
+
+  echo ">> removing $folder_name from $FOLDERS_JSON"
+  folders_remove "$folder_name"
+
+  git -C "$MAIN" worktree prune
+  echo "done. (branch '$branch' was NOT deleted)"
+}
+
+cmd_ls() {
+  git -C "$MAIN" worktree list
+}
+
+case "${1:-}" in
+  new) shift; cmd_new "$@" ;;
+  rm)  shift; cmd_rm  "$@" ;;
+  ls)  shift; cmd_ls  "$@" ;;
+  ""|-h|--help) usage ;;
+  *) die "unknown command: $1" ;;
+esac
