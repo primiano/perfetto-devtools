@@ -1,0 +1,10 @@
+#!/bin/sh
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+  echo "node: could not determine git repo root" >&2
+  exit 1
+}
+tool="$repo_root/tools/node"
+if [ -x "$tool" ]; then
+  exec "$tool" "$@"
+fi
+exec node "$@"
